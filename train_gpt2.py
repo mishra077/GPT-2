@@ -101,7 +101,23 @@ class GPT(nn.Module):
         ))
         
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias = False)
+    
+    def forward(self, idx):
+        B,T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos) # (T, n_embed)
+        tok_emb = self.transformer.wte(idx) # (B, T, n_embed)
+        x = tok_emb + pos_emb
         
+        for block in self.transformer.h:
+            x = block(x)
+        
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        return logits
+     
     @classmethod
     def from_pretrained(cls, model_type):
         """ Loads pretrained GPT-2 model weights from hugging face"""
@@ -153,5 +169,51 @@ class GPT(nn.Module):
         
         
 # ---------------------------------------------------------------------------------------------------------------------------------
+num_return_sequences = 5
+max_length = 50
+
 model = GPT.from_pretrained('gpt2')
-print("didn't crash yay !!!")
+model.eval()
+model.to('cuda')
+
+
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model")
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+"""
+
+tensor([[15496,    11,   314,  1101,   257,  3303,  2746],
+        [15496,    11,   314,  1101,   257,  3303,  2746],
+        [15496,    11,   314,  1101,   257,  3303,  2746],
+        [15496,    11,   314,  1101,   257,  3303,  2746],
+        [15496,    11,   314,  1101,   257,  3303,  2746]])
+
+"""
+x = tokens.to('cuda')
+
+B, T = x.shape # {B: 5, T: 7}
+print(f"shape of the input: {B}, {T}")
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+
+while x.size(1) < max_length: # 7->30
+    with torch.no_grad():
+        logits = model(x) # {num_return_sequences, T, vocab_size}
+        logits = logits[:, -1, :] # taking last column's logit which is of size (1, 50257)
+        probs=  F.softmax(logits, dim = -1)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim = -1) # prob with their indices
+        # topk_indices : shape {num_return_sequences, 50}
+        ix = torch.multinomial(topk_probs, 1)
+        # shape {B: num_return_sequences, 1} 
+        xcol = torch.gather(topk_indices, -1, ix) # shape : {B: num of samples, 1}
+        x = torch.cat((x, xcol), dim = 1) 
+
+# final shape of x : {num_return_sequences, max_length}
+
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    print(tokens)
+    decoded = enc.decode(tokens)
+    print(">", decoded)
