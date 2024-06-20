@@ -18,6 +18,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embed , 3 * config.n_embed, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=config.bias)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embed = config.n_embed
@@ -50,6 +51,8 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embed, config.n_embed * 4, bias = config.bias)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embed, config.n_embed, bias = config.bias)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+
         
     def forward(self, x):
         x = self.c_fc(x)
@@ -161,6 +164,23 @@ class GPT(nn.Module):
         ))
         
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias = False)
+        
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+        
+        # init params
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std = (2 * self.config.n_layer) ** -0.5 
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, idx, targets=None):
         B,T = idx.size()
@@ -233,7 +253,7 @@ class GPT(nn.Module):
         
 # ---------------------------------------------------------------------------------------------------------------------------------
 
-import token
+import tiktoken
 class DataLoaderLite:
     def __init__(self, B, T):
         self.B = B
@@ -276,22 +296,13 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps" # for mac books
 print(f"using device: {device}")
 
-
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
 
 # get a data batch
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
-
-B, T = 4, 32
-buff = torch.tensor(tokens[:B*T + 1])
-buff = buff.to(device)
-x = buff[:-1].view(B,T)
-y = buff[1:].view(B,T)
+train_loader = DataLoaderLite(B = 4, T = 32)
 
 
 
@@ -304,6 +315,8 @@ model.to(device)
 optimzer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
 for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     optimzer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
