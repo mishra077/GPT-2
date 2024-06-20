@@ -78,6 +78,66 @@ class Block(nn.Module):
     ----------------------------------------   ---------------------------------
 """
 
+def ce(y, logits):
+    
+    """
+    
+    Here is the implementation of cross-entropy function
+    
+    In pytorch, we pass logits (unormalized final scores of your model) and target classes
+    Now for next token prediction for traget we have indices of vocab, which indicates at what position we have which tokens.
+    
+    Cross Entropy function is basically applying softmax function with Negative Log Likelihood.
+    But logits can be very large which can make their exponents even larger, thus for numerical stability and faster calculation,
+    pytorch has adopted log softmax 
+    
+    softmax(x) = exp(x_i) / sigma(exp(x_j)) 
+               => exp(x_i - b) * exp(b) / sigma(exp(x_j - b) * exp(b))
+               => exp(x_i - b) / sigma(exp(x_j - b)) , where b = max(x)
+
+    log(softmax(x)) = log(exp(x_i) / sigma(exp(x_j)))
+                    => log(exp(x_i)) - log(sigma(exp(x_j)))
+                    => x_i - log(sigma(exp(x_j)))
+                    => x_i - log(sigma(exp(x_j - c) * exp(c)))
+                    => x_i - log(sigma(exp(x_j - c))) - log(exp(c))
+                    => x_i - c - log(sigma(exp(x_j - c))), where c = max(x)
+                    
+                    
+    After computing log softmax, we computer negative log likelihood
+    Now given log_probs from log-softmax we need to find the vocab prob wrt target class.
+    log_probs.gather(1, y.unsqueeze(1)) -> reteriving the value of probability coressponding to its target index which is y
+    now take the negative mean for all the batches and thats you nn.CrossEntropy loss function.
+    
+    """
+    
+    
+    with torch.no_grad():
+        
+        logits = logits.view(-1, logits.size(-1)) # shape = [B * T, vocab_size]
+        y = y.view(-1)
+    
+        batch_size, num_classes = logits.shape
+
+        # Compute log softmax
+        logits_max = logits.max(dim=1, keepdim=True)[0]  # Compute max along class dimension, shape = [B*T, 1]
+        
+        logits_exp = torch.exp(logits - logits_max)  # Subtract max for numerical , shape = [B*T, vocab_size]
+        logits_sum = logits_exp.sum(dim=1, keepdim=True)  # Sum along class dimension, shape = [B* T, 1]
+        log_probs = logits - logits_max - torch.log(logits_sum)  # Log softmax shape = [B*T, vocab_size]
+        
+        # Compute negative log likelihood
+        log_probs_targets = log_probs.gather(1, y.unsqueeze(1)).squeeze(1)  # Gather log probs for targets, shape = [B*T, 1]
+        
+        nll_loss = -log_probs_targets.mean()  # Compute negative log likelihood loss
+    
+        print(nll_loss)
+        
+        # log_probs = F.log_softmax(logits, dim=1)  # Compute log softmax along class dimension
+        # nll_loss = F.nll_loss(log_probs, y, reduction='mean')  # Compute negative log likelihood loss
+    
+    # print(nll_loss)
+
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -102,7 +162,7 @@ class GPT(nn.Module):
         
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias = False)
     
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B,T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
@@ -116,8 +176,11 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
-     
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+    
     @classmethod
     def from_pretrained(cls, model_type):
         """ Loads pretrained GPT-2 model weights from hugging face"""
@@ -169,16 +232,94 @@ class GPT(nn.Module):
         
         
 # ---------------------------------------------------------------------------------------------------------------------------------
+
+import token
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        
+        with open('input.txt', 'r') as f:
+            text = f.read()
+            
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"Loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        
+        
+        # state
+        self.current_position = 0
+    
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        x = buf[:-1].view(B,T) # inputs
+        y = buf[1:].view(B, T) # targets
+        
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch would be out of bounds, reset
+        if(self.current_position + B * T + 1 > len(self.tokens)):
+            self.current_position = 0
+            
+        return x, y
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+
+# attempt to autodetect the device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps" # for mac books
+print(f"using device: {device}")
+
+
+
+
+# get a data batch
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+
+B, T = 4, 32
+buff = torch.tensor(tokens[:B*T + 1])
+buff = buff.to(device)
+x = buff[:-1].view(B,T)
+y = buff[1:].view(B,T)
+
+
+
+# get logits and loss
+model = GPT(GPTConfig())
+model.to(device)
+# logits, loss = model(x, y)
+
+
+optimzer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+for i in range(50):
+    optimzer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimzer.step()
+    print(f"step {i + 1}, loss: {loss.item()}")
+
+
+import sys; sys.exit(0)
 num_return_sequences = 5
 max_length = 50
 
-model = GPT.from_pretrained('gpt2')
+#model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
 model.eval()
-model.to('cuda')
+model.to(device)
 
-
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
 tokens = enc.encode("Hello, I'm a language model")
 tokens = torch.tensor(tokens, dtype=torch.long)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
@@ -191,7 +332,7 @@ tensor([[15496,    11,   314,  1101,   257,  3303,  2746],
         [15496,    11,   314,  1101,   257,  3303,  2746]])
 
 """
-x = tokens.to('cuda')
+x = tokens.to(device)
 
 B, T = x.shape # {B: 5, T: 7}
 print(f"shape of the input: {B}, {T}")
