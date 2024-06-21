@@ -3,11 +3,26 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import wandb
+import inspect
+# -----------------------------------------------------------------------------------#
+
+wandb.init(
+    # set the wandb project where this run will be logged
+    project="GPT2",
+
+    # track hyperparameters and run metadata
+    config={
+    "learning_rate": 3e-4,
+    "architecture": "GPT2",
+    "dataset": "tinyshakespeare",
+    "batch_size": 4,
+    "epochs": 50,
+    }
+)
 
 # -----------------------------------------------------------------------------------#
 ### x = x + f(x)
-    
-    
 class CausalSelfAttention(nn.Module):
     
     def __init__(self, config):
@@ -34,11 +49,14 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim = -1)
+        # y = att @ v
         
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim = -1)
-        y = att @ v
+        # flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         
@@ -249,6 +267,43 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
                     
         return model
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters (that required grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed otherwise No.
+        # i.e., all wt tensors in matmuls + embeddings decay, all biases and layernorms don't
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tenosrs: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available.
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        
+        """
+        
+        Fused AdamW optimizer is an optimized implementation of the AdamW (Adam with weight decay) algorithm that aims to improve performance, especially on GPUs. 
+        
+        Here are the key points about fused AdamW:
+            1. Performance Improvement: Fused AdamW is designed to be faster than the standard AdamW implementation, particularly for large models and when training on GPUs.
+            2. Fusion Techniques:
+                It fuses multiple operations into a single CUDA kernel, reducing memory bandwidth and improving computational efficiency.
+                Specifically, it implements two main fusions:
+                    a) Fusion of the Adam update's elementwise operations.
+                    b) A multi-tensor apply launch that batches the elementwise updates applied to all the model's parameters into one or a few kernel launches
+        
+        """
+        return optimizer
         
         
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -266,7 +321,7 @@ class DataLoaderLite:
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
         print(f"Loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} samples")
         
         
         # state
@@ -287,7 +342,7 @@ class DataLoaderLite:
         return x, y
 
 # ---------------------------------------------------------------------------------------------------------------------------------
-
+import time
 # attempt to autodetect the device
 device = "cpu"
 if torch.cuda.is_available():
@@ -302,27 +357,113 @@ if torch.cuda.is_available():
 
 
 # get a data batch
-train_loader = DataLoaderLite(B = 4, T = 32)
+train_loader = DataLoaderLite(B = 2, T = 1024)
 
-
+# set the mat mul precision
+torch.set_float32_matmul_precision("high")
 
 # get logits and loss
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+model = torch.compile(model)
+wandb.watch(model)
 # logits, loss = model(x, y)
 
+# learning rate scheduler
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
 
-optimzer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+def get_lr(it):
+    # 1. linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    
+    # 2. if it > lr_decay_iters, return minimum learning rate
+    if it > max_steps:
+        return min_lr
+    
+    # 3. in between use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    """
+    1. The Cosine Function:
+        > The cosine function cos(x) oscillates between -1 and 1.
+        > When x = 0, cos(x) = 1
+        > When x = π (pi), cos(x) = -1
+    2. The Role of decay_ratio:
+        > decay_ratio goes from 0 to 1 as training progresses.
+        > When multiplied by π, it scales the input to the cosine function from 0 to π.
+    3. The Math.cos(math.pi * decay_ratio) Part:
+        > At the start of decay (decay_ratio = 0): cos(0) = 1
+        > At the end of decay (decay_ratio = 1): cos(π) = -1
+    4. The 1.0 + ... Part:
+        > This shifts the cosine output from the range [-1, 1] to [0, 2]
+    5. The 0.5 * ... Part:
+        > This scales the result to the range [0, 1]
+    """
+    
+    return min_lr + coeff * (max_lr - min_lr)
 
-for i in range(50):
+# optimizer
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas= (0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device = device)
+
+for step in range(max_steps):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
-    optimzer.zero_grad()
-    logits, loss = model(x, y)
+    optimizer.zero_grad()
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
-    optimzer.step()
-    print(f"step {i + 1}, loss: {loss.item()}")
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # determine the lr and set it
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    optimizer.step()
+    torch.cuda.synchronize() # wait for the gpu to finish the work
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time diff in secs
+    tokens_processed = train_loader.B * train_loader.T
+    tokens_per_sec = tokens_processed / (t1 - t0)
+    wandb.log({
+        "loss": loss.item(),
+        "time_elapsed": dt,
+        "gpu_memory": torch.cuda.max_memory_allocated(device) / 1024 ** 2  # in MB
+    })
+    print(f"step {step} | loss: {loss.item()} | norm: {norm:.4f} | lr: {lr:.4e} | time elapsed: {dt:.2f} ms | tok/sec: {tokens_per_sec:.2f}")
 
+
+"""
+>>> logits.dtype
+torch.bfloat16
+>>> model.transformer.wte
+Embedding(50257, 768)
+>>> model.transformer.wte.weight
+Parameter containing:
+tensor([[ 9.9743e-05,  1.6065e-03,  1.6118e-02,  ..., -2.3506e-02,
+         -9.5092e-03,  8.6977e-04],
+        [ 5.6103e-03, -8.9315e-04,  3.3858e-02,  ...,  1.8497e-02,
+         -1.2024e-02,  4.2558e-03],
+        [ 1.2853e-02,  8.0832e-03,  1.8367e-02,  ..., -2.2407e-02,
+         -1.2174e-02, -1.2083e-02],
+        ...,
+        [ 6.8869e-03,  1.8946e-02,  2.7229e-02,  ..., -9.2498e-03,
+         -1.6403e-02,  1.1806e-02],
+        [-6.4153e-03,  6.4614e-03, -1.8471e-02,  ...,  3.3779e-04,
+          8.5628e-03, -4.6225e-03],
+        [ 4.5271e-03, -2.1883e-02,  2.6784e-02,  ..., -4.7267e-03,
+         -1.2253e-02,  2.1918e-02]], device='cuda:0', requires_grad=True)
+>>> model.transformer.wte.weight.dtype
+torch.float32
+
+
+
+"""
 
 import sys; sys.exit(0)
 num_return_sequences = 5
