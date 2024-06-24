@@ -309,23 +309,52 @@ class GPT(nn.Module):
 # ---------------------------------------------------------------------------------------------------------------------------------
 
 import tiktoken
+import numpy as np
+enc = tiktoken.get_encoding('gpt2')
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
+
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}, "split can be either train or val"
         
-        with open('input.txt', 'r') as f:
-            text = f.read()
-            
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"Loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} samples")
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        # with open('input.txt', 'r') as f:
+        #     text = f.read()
+        self.reset()
+        # enc = tiktoken.get_encoding('gpt2')
+        # tokens = enc.encode(text)
+        # self.tokens = torch.tensor(tokens)
+        # print(f"Loaded {len(self.tokens)} tokens")
+        # print(f"1 epoch = {len(self.tokens) // (B * T)} samples")
         
         
-        # state
-        self.current_position = 0
+        # state, init at shard zero
+        # self.current_position = self.B * self.T * self.process_rank
+        # self.current_shard = 0
+        # self.tokens = load_tokens(self.shards[self.current_shard])
+    
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
     
     def next_batch(self):
         B, T = self.B, self.T
@@ -334,46 +363,120 @@ class DataLoaderLite:
         y = buf[1:].view(B, T) # targets
         
         # advance the position in the tensor
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, reset
-        if(self.current_position + B * T + 1 > len(self.tokens)):
-            self.current_position = 0
+        if(self.current_position + B * T * self.num_processes + 1 > len(self.tokens)):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = self.B * self.T * self.process_rank
             
         return x, y
 
 # ---------------------------------------------------------------------------------------------------------------------------------
 import time
-# attempt to autodetect the device
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps" # for mac books
-print(f"using device: {device}")
+import os
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+# set up the DDP (Distributed Data Parallel)
+# torch run command sets the env variables RANK, LOCAL_RANK and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to the RANK
+    assert torch.cuda.is_available(), "CUDA is required for DDP at the moment!"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging and checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    
+    # attempt to autodetect the device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps" # for mac books
+    print(f"using device: {device}")
+    
+
+
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+B=2 # micro batch size per gpu
+T=1024 # sequence length per gpu
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps= total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
 # get a data batch
-train_loader = DataLoaderLite(B = 2, T = 1024)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 # set the mat mul precision
 torch.set_float32_matmul_precision("high")
 
-# get logits and loss
+# create model
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
-wandb.watch(model)
+
+"""
+In distributed data parallelism, the model is repleated to all GPUs available.
+Now during forward pass, the calculations are identical.
+But, during back-propogation the gradient cacluated in all the GPU will be taken out
+to calculate the avg gradient using ALL-REDUCE method. The avg gradients will be broadcasted
+again to all GPUs for weight updation.
+
+ In distributed data parallelism, particularly in frameworks like PyTorch's DistributedDataParallel (DDP), the optimization process involves synchronizing gradients across multiple GPUs. This synchronization is typically done using an operation called All-Reduce. Here's a detailed explanation of how this works and how it can be optimized:
+Gradient Synchronization in Distributed Data Parallelism
+Gradient Calculation:
+Each GPU computes the gradients for its portion of the data independently.
+All-Reduce Operation:
+After computing the gradients, an All-Reduce operation is performed to aggregate these gradients across all GPUs.
+The All-Reduce operation sums the gradients from all GPUs and then distributes the summed gradients back to each GPU.
+Each GPU then divides the summed gradients by the number of GPUs to get the average gradient.
+Optimization by Overlapping Computation and Communication
+To optimize this process, the gradient synchronization can be overlapped with the backward pass computation. This is often referred to as gradient bucketing or bucketed all-reduce. Here's how it works:
+Layer-wise Gradient Calculation:
+As each layer's gradients are computed during the backward pass, they are immediately scheduled for the All-Reduce operation.
+This means that instead of waiting for the entire backward pass to complete, the gradients for earlier layers can start being synchronized while later layers are still being computed.
+Bucketed All-Reduce:
+Gradients are grouped into buckets, and the All-Reduce operation is performed on these buckets as soon as they are ready.
+This reduces the idle time for GPUs and overlaps communication with computation, leading to better utilization of resources and reduced overall training time.
+Benefits
+Reduced Latency: By overlapping gradient synchronization with gradient computation, the overall latency is reduced.
+Improved Resource Utilization: GPUs spend less time waiting for synchronization to complete, leading to better utilization of computational resources.
+Scalability: This approach scales better with the number of GPUs, as the communication overhead is distributed throughout the backward pass rather than being concentrated at the end.
+
+"""
+if ddp:
+    model = DDP(model , device_ids = [ddp_local_rank])
+raw_model = model.module if ddp else model
+wandb.watch(raw_model)
 # logits, loss = model(x, y)
 
 # learning rate scheduler
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715
+max_steps = 19073
 
 def get_lr(it):
     # 1. linear warmup for warmup_iters steps
@@ -409,16 +512,100 @@ def get_lr(it):
 
 # optimizer
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas= (0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device = device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device = device)
+
+# create the log directory we will write checkpoints to and log to
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass
+
 
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
+    last_step = (step == max_steps - 1)
+    # once in a while evaluate our validation loss
+    if step > 0 and step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+    
+        if ddp:
+            dist.all_reduce(val_loss_accum, op = dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss : {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 5000 == 0 or last_step):
+                # optionally write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item()
+                }
+                # you might also want to add optimizer.state_dict() and
+                # rng seeds etc., if you wanted to more exactly resume training
+                torch.save(checkpoint, checkpoint_path)
+    
+    # once in a while generate from the model (except step 0, which is noisy)
+    if step > 0 and step % 100 == 0 and False:
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a language model, ")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        while xgen.size(1) < max_length:
+            with torch.no_grad():
+                logits, loss = model(xgen)
+                logits = logits[:, -1, :]
+                probs = F.softmax(logits, dim=-1)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
+                xcol = torch.gather(topk_indices, -1, ix)
+                xgen = torch.cat((xgen, xcol), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
+    
+    # training loop
+    model.train()
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    # Gradient Accumulation Step for ~0.5M batch size
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        # we have to scale the loss to account for gradient accumulation
+        # because the gradients just add on each successive backward()
+        # addition of gradients coressponds to a SUM in the objective, but
+        # intead of SUM we want MEAN. Scale the loss here so it comes out right. 
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) 
+        loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine the lr and set it
     lr = get_lr(step)
@@ -428,15 +615,18 @@ for step in range(max_steps):
     torch.cuda.synchronize() # wait for the gpu to finish the work
     t1 = time.time()
     dt = (t1 - t0)*1000 # time diff in secs
-    tokens_processed = train_loader.B * train_loader.T
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / (t1 - t0)
     wandb.log({
-        "loss": loss.item(),
+        "loss": loss_accum.item(),
         "time_elapsed": dt,
         "gpu_memory": torch.cuda.max_memory_allocated(device) / 1024 ** 2  # in MB
     })
-    print(f"step {step} | loss: {loss.item()} | norm: {norm:.4f} | lr: {lr:.4e} | time elapsed: {dt:.2f} ms | tok/sec: {tokens_per_sec:.2f}")
+    if master_process:
+        print(f"step {step} | loss: {loss_accum.item():.6f} | norm: {norm:.4f} | lr: {lr:.4e} | time elapsed: {dt:.2f} ms | tok/sec: {tokens_per_sec:.2f}")
 
+if ddp:
+    destroy_process_group()
 
 """
 >>> logits.dtype
