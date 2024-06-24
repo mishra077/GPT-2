@@ -50,7 +50,7 @@ But, how this $\alpha_i$ is calculated?
 In previous section we saw how to calculate attention score. But we there are trainabale parameters for our model to learn for these similarity scores. Lets introduce them:
 
 $$
-q = W_q x \\ k=W_kx \\ v = W_v x
+q = W_q x\\k=W_kx\\v = W_v x
 $$
 
 In the given above equations, we can think of projecting these input vectors into higher dimesions for better representations. Each dimensions can be interpreted as some properties like: semantics, contextual features, syntatic features, etc.
