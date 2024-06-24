@@ -24,6 +24,7 @@ In transformer paradigm there are 3 major attention types:
 
 ### Self-Attention
 As the word suggests, in self-attention the words attend themesleves, like one to many mapping. Consider input set:
+
 $$
 \{x_i\}_{i=1}^{i=t} = \{x_1,\ldots,x_t\}
 $$
@@ -47,11 +48,13 @@ But, how this $\alpha_i$ is calculated?
 
 #### Query Keys and Value
 In previous section we saw how to calculate attention score. But we there are trainabale parameters for our model to learn for these similarity scores. Lets introduce them:
+
 $$
 q = W_q x \\
 k=W_kx \\
 v = W_v x
 $$
+
 In the given above equations, we can think of projecting these input vectors into higher dimesions for better representations. Each dimensions can be interpreted as some properties like: semantics, contextual features, syntatic features, etc.
 
 Lets understand this by an example taken from [**Deep Learning notes from NYU**](https://atcold.github.io/NYU-DLSP20/en/week12/12-3/)
@@ -65,9 +68,11 @@ We compare the query ***lasagne*** with all keys ***recipe titles*** to get atte
 $$
 a = \text{softmax}\left(\frac{K^\top q}{\sqrt{d}}\right) \in \mathbb{R}^t
 $$
+
 The attention weights $a_1, a_2, \ldots$ represent how relevant each token is to the current query.
 The attention weights $a$ are then used to compute a weighted sum of the Value (V) vectors. This step aggregates the information from the input sequence based on the relevance determined by the attention weights.
 Now this output is very important for us as this contains which tokens are important given the context of input tokens. This projects the Value vectors into new representation. This new representation emphasizes the tokens that are more relvant to the query and de-emphasizes those that are less relevant. Essentially, it *projects* the value vectors into a space where the importance of each token is adjusted based on the attention scores. The resulting vector is a context-aware representation that captures the relationships and dependencies between tokens.
+
 $$
 H = VA \in \mathbb{R}^{d \times t}
 $$
