@@ -23,14 +23,15 @@ In transformer paradigm there are 3 major attention types:
 - Causal Attention
 
 ### Self-Attention
-As the word suggests, in self-attention the words attend themesleves, like one to many mapping. 
-Consider input set: 
+As the word suggests, in self-attention the words attend themesleves, like one to many mapping. Consider input set:
 $$
 \{x_i\}_{i=1}^{i=t} = \{x_1,\ldots,x_t\}
 $$
+
 $$
 X \in \mathbb{R}^{n \times t}
 $$
+
 In the context of self-attention, the hidden state is formed by combining the input tokens $x_1, x_2\ldots,x_t$ with the corresponding attention weights $\alpha_1,\alpha_2\ldots,\alpha_t$
 $$h = \alpha_1 x_1 + \alpha_2 x_2 + \cdots + \alpha_t x_t$$
 In self-attention, the model computes the attention weights $\alpha_i$ based on the relationship between tokens in the sequence. This allows the model to focus on different parts of the input sequence when forming the hidden representation.
