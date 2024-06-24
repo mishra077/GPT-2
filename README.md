@@ -38,9 +38,7 @@ $$h = \alpha_1 x_1 + \alpha_2 x_2 + \cdots + \alpha_t x_t$$
 In self-attention, the model computes the attention weights $\alpha_i$ based on the relationship between tokens in the sequence. This allows the model to focus on different parts of the input sequence when forming the hidden representation.
 
 $$
-
 a = [\text{soft}](\text{arg})\max_\beta(X^\top x)
-
 $$
 
 But, how this $\alpha_i$ is calculated?
@@ -53,9 +51,7 @@ In previous section we saw how to calculate attention score. But we there are tr
 
 $$
 q = W_q x \\
-
 k=W_kx \\
-
 v = W_v x
 $$
 
