@@ -114,7 +114,7 @@ During the text generation any word is dependent upon its previous words and if 
 For GPU specs you can find it on this spec sheet provided by NVIDIA. However, I was not able to find specfically for my GPU but here is details for RTX 3070 GPU. You can also check in this document for your own GPU: [NVIDIA AMPERE GA102](https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.pdf#page=47&zoom=100,93,68)
 The reason I mentioned this hardware spec is because now we are going to discuss some optimizations. And if your current GPU architecture design in old then some optimizations will fail.
 ## Using Lower Precisions
-<div  align="center" href="https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf#page=27&zoom=100,93,464">
+<div  align="center" onclick="https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf#page=27&zoom=100,93,464">
 <img  src="mix-precision.png"  alt="drawing"  width="500"/>
 </div>
 
