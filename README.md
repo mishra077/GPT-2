@@ -114,13 +114,15 @@ During the text generation any word is dependent upon its previous words and if 
 For GPU specs you can find it on this spec sheet provided by NVIDIA. However, I was not able to find specfically for my GPU but here is details for RTX 3070 GPU. You can also check in this document for your own GPU: [NVIDIA AMPERE GA102](https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.pdf#page=47&zoom=100,93,68)
 The reason I mentioned this hardware spec is because now we are going to discuss some optimizations. And if your current GPU architecture design in old then some optimizations will fail.
 ## Using Lower Precisions
-<div  align="center">
+<div  align="center" href="https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf#page=27&zoom=100,93,464">
 <img  src="mix-precision.png"  alt="drawing"  width="500"/>
 </div>
 
 The tranformer architecture has lots of Linear layers and these layers under the hood do lots of matrix multiplications. By default these numbers are in 32-bits floating point (FP32). During matrix multiplication we can reduce this precision by half by using TF32 explicity. TF32 maintains the same numeric range as FP32 using 8 exponent bits, while reducing the mantissa precision to 10 bits (vs 23 bits in FP32). This reduced precision has been shown to be sufficient for most deep learning workloads. Inside the tensor cores of a GPU, the multiplication operation happens in TF32 but during the accumulation of all the numbers i.e., the sum of individual elements happen in FP32. This acclerates the muliplication operations by 5x which helps in reducing the training time of our model. Emprically this reduction doesn't impact so much during the training, infact it matches with FP32 accuracy, loss values, and training behavior.
 
 We can turn this on by setting ```torch.set_float32_matmul_precision``` to ```high```. See this documentation by Pytorch: [torch.set_float32_matmul_precision](https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html)
+
+Also check out this stackoverflow answer on the differences between CUDA cores and Tensor cores. # [What is the difference between cuda vs tensor cores?](https://stackoverflow.com/questions/47335027/what-is-the-difference-between-cuda-vs-tensor-cores)
 
 ## Automatic Mix Precision Package (Pytorch)
 
